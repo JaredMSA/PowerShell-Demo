@@ -1,0 +1,312 @@
+#Requires -Version 5.0
+<#
+.SYNOPSIS
+    Creates draft Outlook emails based on data from an Excel file with HTML templates and attachments.
+
+.DESCRIPTION
+    Reads an Excel file containing recipient information, email templates, and attachment paths.
+    Creates draft emails in Outlook with HTML bodies and multiple attachments.
+
+.PARAMETER ExcelPath
+    Path to the Excel file containing email data.
+
+.PARAMETER TemplateFolder
+    Folder path where HTML template files are stored.
+
+.PARAMETER AttachmentFolder
+    Folder path where attachment files are stored.
+
+.PARAMETER DryRun
+    If specified, shows what would be done without creating actual emails.
+
+.EXAMPLE
+    .\Send-EmailsFromExcel.ps1 -ExcelPath "C:\Data\emails.xlsx" -TemplateFolder "C:\Templates" -AttachmentFolder "C:\Attachments"
+
+.NOTES
+    Author: PowerShell Script
+    Date: 2026-09-17
+    Requires: Outlook installed and COM interface available
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$ExcelPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [string]$TemplateFolder,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path $_ -PathType Container })]
+    [string]$AttachmentFolder,
+
+    [switch]$DryRun
+)
+
+# ===========================
+# Configuration & Constants
+# ===========================
+$ErrorActionPreference = "Stop"
+$VerbosePreference = "Continue"
+
+# Outlook constants
+$olMailItem = 0
+$olByValue = 1
+
+# ===========================
+# Function Definitions
+# ===========================
+
+function Get-ExcelData {
+    <#
+    .SYNOPSIS
+    Reads data from an Excel file.
+    #>
+    param(
+        [string]$FilePath
+    )
+
+    try {
+        # Create Excel COM object
+        $excel = New-Object -ComObject Excel.Application
+        $excel.Visible = $false
+        $excel.ScreenUpdating = $false
+        
+        # Open workbook
+        $workbook = $excel.Workbooks.Open($FilePath)
+        $worksheet = $workbook.Sheets.Item(1)
+        
+        # Get used range
+        $usedRange = $worksheet.UsedRange
+        $rows = $usedRange.Rows.Count
+        $cols = $usedRange.Columns.Count
+        
+        Write-Verbose "Excel file has $rows rows and $cols columns"
+        
+        # Extract headers
+        $headers = @()
+        for ($col = 1; $col -le $cols; $col++) {
+            $headers += $worksheet.Cells.Item(1, $col).Value2
+        }
+        
+        Write-Verbose "Headers: $($headers -join ', ')"
+        
+        # Extract data
+        $data = @()
+        for ($row = 2; $row -le $rows; $row++) {
+            $record = @{}
+            for ($col = 1; $col -le $cols; $col++) {
+                $value = $worksheet.Cells.Item($row, $col).Value2
+                $record[$headers[$col - 1]] = $value
+            }
+            $data += $record
+        }
+        
+        # Cleanup
+        $workbook.Close($false)
+        $excel.Quit()
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+        
+        return $data
+    }
+    catch {
+        Write-Error "Failed to read Excel file: $_"
+        throw
+    }
+}
+
+function Get-HtmlTemplate {
+    <#
+    .SYNOPSIS
+    Reads an HTML template file and returns its content.
+    #>
+    param(
+        [string]$TemplateName,
+        [string]$TemplateFolder
+    )
+
+    $templatePath = Join-Path $TemplateFolder "$TemplateName.html"
+    
+    if (-not (Test-Path $templatePath -PathType Leaf)) {
+        Write-Warning "Template not found: $templatePath"
+        return $null
+    }
+    
+    try {
+        $content = Get-Content -Path $templatePath -Raw -Encoding UTF8
+        Write-Verbose "Loaded template: $TemplateName"
+        return $content
+    }
+    catch {
+        Write-Error "Failed to read template '$TemplateName': $_"
+        return $null
+    }
+}
+
+function Get-AttachmentPaths {
+    <#
+    .SYNOPSIS
+    Builds a list of attachment paths from the record, filtering out nulls and empty strings.
+    #>
+    param(
+        [hashtable]$Record,
+        [string]$AttachmentFolder
+    )
+
+    $attachments = @()
+    
+    # Get all columns that might contain attachments (excluding standard columns)
+    $attachmentColumns = $Record.Keys | Where-Object { 
+        $_ -notin @('Name', 'Email', 'Email Template', 'Language') 
+    }
+    
+    foreach ($column in $attachmentColumns) {
+        $filename = $Record[$column]
+        
+        if ($filename) {
+            $fullPath = Join-Path $AttachmentFolder $filename
+            
+            if (Test-Path $fullPath -PathType Leaf) {
+                $attachments += $fullPath
+                Write-Verbose "  Added attachment: $filename"
+            }
+            else {
+                Write-Warning "  Attachment not found: $fullPath"
+            }
+        }
+    }
+    
+    return $attachments
+}
+
+function Create-OutlookDraft {
+    <#
+    .SYNOPSIS
+    Creates a draft email in Outlook with HTML body and attachments.
+    #>
+    param(
+        [string]$RecipientEmail,
+        [string]$RecipientName,
+        [string]$Subject,
+        [string]$HtmlBody,
+        [string[]]$AttachmentPaths,
+        [switch]$DryRun
+    )
+
+    try {
+        if ($DryRun) {
+            Write-Host "`n=== DRY RUN: Would create draft email ===" -ForegroundColor Cyan
+            Write-Host "To: $RecipientEmail ($RecipientName)"
+            Write-Host "Subject: $Subject"
+            Write-Host "Attachments: $($AttachmentPaths.Count) file(s)"
+            foreach ($path in $AttachmentPaths) {
+                Write-Host "  - $(Split-Path $path -Leaf)"
+            }
+            return $true
+        }
+        
+        # Create Outlook COM object
+        $outlook = New-Object -ComObject Outlook.Application
+        $namespace = $outlook.GetNamespace("MAPI")
+        $drafts = $namespace.GetDefaultFolder(3)  # 3 = olFolderDrafts
+        
+        # Create new mail item
+        $mail = $outlook.CreateItem($olMailItem)
+        $mail.To = $RecipientEmail
+        $mail.Subject = $Subject
+        $mail.HTMLBody = $HtmlBody
+        
+        # Add attachments
+        foreach ($attachmentPath in $AttachmentPaths) {
+            if (Test-Path $attachmentPath -PathType Leaf) {
+                $mail.Attachments.Add($attachmentPath, $olByValue, 1) | Out-Null
+                Write-Verbose "    Attached: $(Split-Path $attachmentPath -Leaf)"
+            }
+        }
+        
+        # Save as draft
+        $mail.Save()
+        
+        Write-Host "✓ Created draft email for: $RecipientEmail" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Error "Failed to create draft for $RecipientEmail`: $_"
+        return $false
+    }
+}
+
+# ===========================
+# Main Script Logic
+# ===========================
+
+Write-Host "PowerShell Email Draft Creator" -ForegroundColor Cyan
+Write-Host "==============================`n"
+
+# Read Excel data
+Write-Host "Reading Excel file..." -ForegroundColor Yellow
+$emailData = Get-ExcelData -FilePath $ExcelPath
+Write-Host "Found $($emailData.Count) email record(s)`n"
+
+if ($DryRun) {
+    Write-Host "Running in DRY RUN mode - no emails will be created`n" -ForegroundColor Yellow
+}
+
+# Process each row
+$successCount = 0
+$failureCount = 0
+
+foreach ($index in 0..($emailData.Count - 1)) {
+    $record = $emailData[$index]
+    
+    Write-Host "Processing record $($index + 1) of $($emailData.Count)..." -ForegroundColor Cyan
+    Write-Verbose "  Name: $($record['Name'])"
+    Write-Verbose "  Email: $($record['Email'])"
+    Write-Verbose "  Template: $($record['Email Template'])"
+    
+    # Get HTML template
+    $htmlBody = Get-HtmlTemplate -TemplateName $record['Email Template'] -TemplateFolder $TemplateFolder
+    
+    if (-not $htmlBody) {
+        Write-Error "Skipping record due to missing template"
+        $failureCount++
+        continue
+    }
+    
+    # Get attachments
+    $attachments = Get-AttachmentPaths -Record $record -AttachmentFolder $AttachmentFolder
+    
+    # Create subject (can be customized)
+    $subject = "$($record['Email Template']) - $($record['Language'])"
+    
+    # Create draft
+    $success = Create-OutlookDraft `
+        -RecipientEmail $record['Email'] `
+        -RecipientName $record['Name'] `
+        -Subject $subject `
+        -HtmlBody $htmlBody `
+        -AttachmentPaths $attachments `
+        -DryRun:$DryRun
+    
+    if ($success) {
+        $successCount++
+    }
+    else {
+        $failureCount++
+    }
+}
+
+# Summary
+Write-Host "`n==============================" -ForegroundColor Cyan
+Write-Host "Summary:" -ForegroundColor Yellow
+Write-Host "  Successful: $successCount"
+Write-Host "  Failed: $failureCount"
+Write-Host "  Total: $($emailData.Count)"
+
+if ($failureCount -eq 0) {
+    Write-Host "`n✓ All emails processed successfully!" -ForegroundColor Green
+}
+else {
+    Write-Host "`n⚠ Some emails failed to process" -ForegroundColor Yellow
+}
